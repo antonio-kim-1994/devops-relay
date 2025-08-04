@@ -1,0 +1,97 @@
+name: Update ECS With ECR Push
+
+on:
+  workflow_call:
+    inputs:
+      TAG:
+        description: 'Container Image Tag'
+        required: true
+        type: string
+      REGISTRY_NAME:
+        description: 'ECR Registry Name'
+        required: true
+        type: string
+      SERVICE_NAME:
+        description: 'Pushed Service name'
+        required: true
+        type: string
+    secrets:
+      AWS_ECR_ADDRESS:
+        description: 'ECR Registry URL'
+        required: true
+      AWS_ROLE:
+        description: 'AWS role for github action'
+        required: true
+
+# 변수에 secrets context가 포함될 경우 job 간 데이터 전송이 불가능하다.
+jobs:
+  update-ecs:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ECR_REGION: ap-northeast-2
+      TASK_DEFINITION_FAMILY_NAME: devops-relay-gateway
+      TAG: ${{ inputs.TAG }}
+      SERVICE_NAME: ${{ inputs.SERVICE_NAME }}
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: devops-relay-image
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE }}
+          role-session-name: ${{ env.SERVICE_NAME }}-github-action
+          role-duration-seconds: 900
+          aws-region: ${{ env.AWS_ECR_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Docker Image load and tagging
+        env:
+          SERVICE_NAME: ${{ env.SERVICE_NAME }}
+          REGISTRY_NAME: ${{ inputs.REGISTRY_NAME }}
+        run: |
+          docker load --input ${SERVICE_NAME}.tar
+          
+          DOCKER_TAG=${{ secrets.AWS_ECR_ADDRESS }}/${{ env.REGISTRY_NAME }}:${{ env.TAG }}
+          echo "DOCKER_TAG=$DOCKER_TAG" >> $GITHUB_ENV
+          docker tag ${{ env.SERVICE_NAME}}:${{ env.TAG }} $DOCKER_TAG
+          
+          # Debug
+          docker image ls
+          
+          docker push $DOCKER_TAG
+
+      - name: Fetch Task Definition
+        run: |
+          echo "TASK_DEFINITION_JSON=${TASK_DEFINITION_FAMILY_NAME}.json" >> $GITHUB_ENV
+          aws ecs describe-task-definition \
+          --task-definition $TASK_DEFINITION_FAMILY_NAME \
+          --query taskDefinition > ${TASK_DEFINITION_FAMILY_NAME}.json
+          
+          if [ -f ${TASK_DEFINITION_FAMILY_NAME}.json ]; then
+            echo "====> Result: ✅ Success to fetch ${TASK_DEFINITION_FAMILY_NAME}.json File."
+          else
+            echo "====> Result: ❌ ${TASK_DEFINITION_FAMILY_NAME}.json not found."
+            exit 1
+          fi
+
+      - name: Update Task Definition
+        id: task-def-update
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.TASK_DEFINITION_JSON }}
+          container-name: ${{ env.TASK_DEFINITION_FAMILY_NAME }}
+          image: ${{ env.DOCKER_TAG }}
+
+      - name: Deploy ECS with New Task Definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def-update.outputs.task-definition }}
+          service: ${{ env.TASK_DEFINITION_FAMILY_NAME }}
+          cluster: ${{ env.TASK_DEFINITION_FAMILY_NAME }}
+          wait-for-service-stability: true

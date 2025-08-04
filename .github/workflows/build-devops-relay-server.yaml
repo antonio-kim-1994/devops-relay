@@ -1,0 +1,224 @@
+name: DevOps Relay Server Builder
+
+run-name: "[Server][ Branch | ${{ github.ref_name }} ] Build Triggered by @${{ github.actor }}"
+
+on:
+  push:
+    branches:
+      - prod
+    paths-ignore:
+      - v2/gateway/**
+      - .github/**
+      - go.*
+      - README.md
+      - .gitignore
+
+  workflow_dispatch:
+
+# 변수에 secrets context가 포함될 경우 job 간 데이터 전송이 불가능하다.
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ECR_REGION: ap-northeast-2
+      GO_SUM_PATH: go.sum
+      BRANCH: ${{ github.ref_name }}
+      ORG: ${{ github.repository_owner }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DEVOPS_CHANNEL }}
+    outputs:
+      TAG: ${{ env.TAG }}
+      DATE: ${{ env.DATE }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Get the latest commit & sha value
+        run: |
+          curl -s -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${{ github.repository }}/commits?sha=${{ github.ref_name }}" \
+          | jq -r '.[0]' > latest_commit.txt
+
+          jq -r '.sha' latest_commit.txt > sha.txt
+          jq -r '.commit.message' latest_commit.txt > commit_message.txt
+
+          echo "COMMIT_SHA=$(cat sha.txt)" >> $GITHUB_ENV
+
+          echo "COMMIT<<EOF" >> $GITHUB_ENV
+          cat commit_message.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+          echo "DATE=$(TZ=Asia/Seoul date -Iseconds)" >> $GITHUB_ENV
+
+      - name: Debug Input variables
+        run: |
+          echo "COMMIT: ${{ env.COMMIT }}"
+          echo "DATE: ${{ env.DATE }}"
+          echo "COMMIT_SHA: ${{ env.COMMIT_SHA }}"
+
+      - name: Reassign variable
+        run: |
+          REPO=$(basename ${{ github.repository }} | tr '[:upper:]' '[:lower:]')
+          echo "REPO=$REPO" >> $GITHUB_ENV
+
+      - name: Slack Notify Service Build
+        uses: ./.github/actions/slack-update-notify-message
+        with:
+          NOTIFY_TYPE: inform
+          COMMIT: ${{ env.COMMIT }}
+          OPERATOR: ${{ github.actor }}
+          DATE: ${{ env.DATE }}
+          REPO: ${{ env.REPO }}
+          BRANCH: ${{ env.BRANCH }}
+          ORG: ${{ env.ORG }}
+          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.DEVOPS_SLACK_BOT_TOKEN }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5.1.0
+        with:
+          go-version: '>=1.23.3'
+          go-version-file: ${{ env.GO_MOD_PATH }}
+          check-latest: true
+          cache-dependency-path: ${{ env.GO_SUM_PATH }}
+          cache: 'false'
+
+      - name: Cache Go
+        uses: actions/cache@v4.2.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ env.REPO }}-${{ hashFiles(env.GO_SUM_PATH) }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ env.REPO }}-
+            ${{ runner.os }}-go-
+
+      - name: Build
+        run: |
+          cd ./v2/server
+          go mod download
+          go mod tidy
+          CGO_ENABLED=0 GOARCH=amd64 GOOS=linux go build -o ./devops-relay-server ./server.go
+
+      - name: Build Docker Image
+        env:
+          BRANCH: ${{ env.BRANCH }}
+          SERVICE_NAME: devops-relay
+          COMMIT_SHA: ${{ env.COMMIT_SHA }}
+          REPO: ${{ env.REPO }}
+        run: |
+          MODIFIED_COMMIT_SHA=$(echo $COMMIT_SHA | cut -c 1-7)
+          TAG=${MODIFIED_COMMIT_SHA}-$(TZ='Asia/Seoul' date +%s)          
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          
+          DOCKER_TAG="$SERVICE_NAME:$TAG"
+          DOCKER_TAG=$(echo $DOCKER_TAG | tr '[:upper:]' '[:lower:]')
+          echo "DOCKER_TAG: $DOCKER_TAG"
+          echo "DOCKER_TAG=$DOCKER_TAG" >> $GITHUB_ENV
+
+          docker build -t $DOCKER_TAG ./v2/server
+          
+          docker image ls
+          
+          docker save --output $SERVICE_NAME.tar $DOCKER_TAG
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: devops-relay-image
+          path: ./*.tar
+          retention-days: 1
+
+      - name: Build result - success
+        if: ${{ success() }}
+        uses: ./.github/actions/slack-update-notify-message
+        with:
+          NOTIFY_TYPE: build-success
+          REPO: ${{ env.REPO }}-server
+          BRANCH: common
+          DOCKER_TAG: ${{ env.TAG }}
+          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.DEVOPS_SLACK_BOT_TOKEN }}
+
+      - name: Build result - fail
+        if: ${{ failure() }}
+        uses: ./.github/actions/slack-update-notify-message
+        with:
+          NOTIFY_TYPE: build-fail
+          REPO: ${{ env.REPO }}-server
+          BRANCH: common
+          DOCKER_TAG: ${{ env.TAG }}
+          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.DEVOPS_SLACK_BOT_TOKEN }}
+
+  push-to-ecr:
+    needs: build
+    uses: ./.github/workflows/push-image-to-ecr.yaml
+    secrets:
+      ECR_ACC_KEY: ${{ secrets.ECR_ACC_KEY }}
+      ECR_SEC_KEY: ${{ secrets.ECR_SEC_KEY }}
+      AWS_ECR_ADDRESS: ${{ secrets.ECR_ADDRESS }}
+    with:
+      TAG: ${{ needs.build.outputs.TAG }}
+      REGISTRY_NAME: common/devops-relay-server
+
+  helm-chart-update-dev:
+    needs: [build, push-to-ecr]
+    uses: ./.github/workflows/update-helm-chart.yaml
+    permissions:
+      contents: write
+    with:
+      TAG: ${{ needs.build.outputs.TAG }}
+      REGISTRY_NAME: common/devops-relay-server
+      CHART_REPO: org-a/eks-helm-dev
+      BRANCH: devops-relay-server
+      DATE: ${{ needs.build.outputs.DATE }}
+    secrets:
+      AWS_ECR_ADDRESS: ${{ secrets.ECR_ADDRESS }}
+      TOKEN_CHART_REPO_COMMIT: ${{ secrets.TOKEN_CHART_REPO_COMMIT }}
+
+  ##### Job Alert
+  alert-deploy-result:
+    needs: [
+      build,
+      helm-chart-update-dev,
+    ]
+    #    needs: [build]
+    runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DEVOPS_CHANNEL }}
+      BRANCH: prod
+      TAG: ${{ needs.build.outputs.TAG }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Variables
+        run: |
+          REPO=$(basename ${{ github.repository }} | tr '[:upper:]' '[:lower:]')
+          echo "REPO=$REPO" >> $GITHUB_ENV
+
+      - name: Deploy result - success
+        id: deploy-success
+        if: ${{ success() }}
+        uses: ./.github/actions/slack-update-notify-message
+        with:
+          NOTIFY_TYPE: deploy-success
+          REPO: ${{ env.REPO }}-server
+          BRANCH: common
+          DOCKER_TAG: ${{ env.TAG }}
+          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.DEVOPS_SLACK_BOT_TOKEN }}
+
+      - name: Deploy result - fail
+        if: ${{ failure() }}
+        uses: ./.github/actions/slack-update-notify-message
+        with:
+          NOTIFY_TYPE: deploy-fail
+          REPO: ${{ env.REPO }}-server
+          BRANCH: common
+          DOCKER_TAG: ${{ env.TAG }}
+          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.DEVOPS_SLACK_BOT_TOKEN }}

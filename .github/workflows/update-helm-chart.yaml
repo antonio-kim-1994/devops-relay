@@ -1,0 +1,79 @@
+name: Update Helm Chart
+
+on:
+  workflow_call:
+    inputs:
+      TAG:
+        description: 'Triggered Event Date'
+        required: true
+        type: string
+      REGISTRY_NAME:
+        description: 'Commited messages'
+        required: true
+        type: string
+      CHART_REPO:
+        description: 'Helm Chart Repository Name'
+        required: true
+        type: string
+      BRANCH:
+        description: 'Target Branch'
+        required: true
+        type: string
+      DATE:
+        description: 'Triggered date'
+        required: true
+        type: string
+    secrets:
+      AWS_ECR_ADDRESS:
+        description: 'ECR URL'
+        required: true
+      TOKEN_CHART_REPO_COMMIT:
+        description: 'Commit Permission to Helm Chart Repo'
+        required: true
+
+# 변수에 secrets context가 포함될 경우 job 간 데이터 전송이 불가능하다.
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.TAG }}
+      DATE: ${{ inputs.DATE }}
+      REGISTRY_NAME: ${{ inputs.REGISTRY_NAME }}
+      CHART_REPO: ${{ inputs.CHART_REPO }}
+      BRANCH: ${{ inputs.BRANCH }}
+      DEPLOY_TYPE: ${{ inputs.DEPLOY_TYPE }}
+    steps:
+      - name: Set Docker TAG
+        run: |
+          DOCKER_TAG=${{ secrets.AWS_ECR_ADDRESS }}/${{ env.REGISTRY_NAME }}:${{ env.TAG }}
+          echo "DOCKER_TAG=$DOCKER_TAG" >> $GITHUB_ENV
+
+      - name: Checkout Chart Prod Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CHART_REPO }}
+          ref: ${{ env.BRANCH }}
+          token: ${{ secrets.TOKEN_CHART_REPO_COMMIT }}
+          path: ${{ env.BRANCH }}
+
+      - name: Update Helm Chart
+        env:
+          DOCKER_TAG: ${{ env.DOCKER_TAG }}
+        run: |
+          yq -i ".rollout.image = \"$DOCKER_TAG\"" "${{ env.BRANCH }}/devops-relay-server/values.yaml"
+
+      - name: Configure git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit changes
+        env:
+          GITHUB_TOKEN: ${{ secrets.TOKEN_CHART_REPO_COMMIT }}
+          DATE: ${{ env.DATE }}
+          TAG: ${{ env.TAG }}
+        run: |
+          cd ${{ env.BRANCH }}
+          git add .
+          git commit -m "[ Service Update | $DATE ] devops-relay:$TAG"
+          git push

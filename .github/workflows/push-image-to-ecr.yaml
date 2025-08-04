@@ -1,0 +1,64 @@
+name: Push Container Image to ECR
+
+on:
+  workflow_call:
+    inputs:
+      TAG:
+        description: 'Container Image Tag'
+        required: true
+        type: string
+      REGISTRY_NAME:
+        description: 'ECR Registry Name'
+        required: true
+        type: string
+    secrets:
+      ECR_ACC_KEY:
+        description: 'ECR User Access Key'
+        required: true
+      ECR_SEC_KEY:
+        description: 'ECR User Secret Key'
+        required: true
+      AWS_ECR_ADDRESS:
+        description: 'ECR Registry URL'
+        required: true
+
+# 변수에 secrets context가 포함될 경우 job 간 데이터 전송이 불가능하다.
+jobs:
+  push-docker-image:
+    runs-on: ubuntu-latest
+    env:
+      SERVICE_NAME: devops-relay
+      AWS_ECR_REGION: ap-northeast-2
+      TAG: ${{ inputs.TAG }}
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: devops-relay-image
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.ECR_ACC_KEY }}
+          aws-secret-access-key: ${{ secrets.ECR_SEC_KEY }}
+          aws-region: ${{ env.AWS_ECR_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Docker Image load and tagging
+        env:
+          SERVICE_NAME: ${{ env.SERVICE_NAME }}
+          REGISTRY_NAME: ${{ inputs.REGISTRY_NAME }}
+        run: |
+          docker load --input ${SERVICE_NAME}.tar
+          
+          DOCKER_TAG=${{ secrets.AWS_ECR_ADDRESS }}/${{ env.REGISTRY_NAME }}:${{ env.TAG }}
+          echo "DOCKER_TAG=$DOCKER_TAG" >> $GITHUB_ENV
+          docker tag ${{ env.SERVICE_NAME}}:${{ env.TAG }} $DOCKER_TAG
+          
+          # Debug
+          docker image ls
+          
+          docker push $DOCKER_TAG
